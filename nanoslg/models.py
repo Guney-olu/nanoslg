@@ -86,7 +86,7 @@ def apply_rotary_emb(
     return (x * cos) + (rotated * sin)
 
 class Attention(nn.Module):
-    """Multi-head attention with Grouped Query Attention (GQA) support."""
+    """Multi-head attention with batched KV cache support."""
     
     def __init__(self, config):
         super().__init__()
@@ -98,6 +98,8 @@ class Attention(nn.Module):
         self.k_proj = nn.Linear(config.hidden_size, self.n_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, self.n_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.n_heads * self.head_dim, config.hidden_size, bias=False)
+        
+        self.layer_idx = None  # Set by TransformerBlock
 
     def forward(
         self,
@@ -105,7 +107,7 @@ class Attention(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-        cache: Optional[Dict] = None,
+        kv_caches: Optional[List[Dict]] = None,  # List of caches, one per batch item
     ) -> torch.Tensor:
         B, Seq, _ = x.shape
         
@@ -113,22 +115,61 @@ class Attention(nn.Module):
         k = self.k_proj(x).view(B, Seq, self.n_kv_heads, self.head_dim)
         v = self.v_proj(x).view(B, Seq, self.n_kv_heads, self.head_dim)
 
+        if kv_caches is not None and len(kv_caches) > 0:
+            # TO Check if this layer has cached values
+            if len(kv_caches[0]) > self.layer_idx and kv_caches[0][self.layer_idx].get('k') is not None:
+                # TO Get start positions per batch item (they should all be the same for simplicity)
+                start_pos = kv_caches[0][self.layer_idx]['k'].shape[1]
+            else:
+                start_pos = 0
+        else:
+            start_pos = 0
+        
         # Position embeddings
-        curr_cos, curr_sin = cos[0:Seq], sin[0:Seq]
-        if cache is not None and cache['k'] is not None:
-            start_pos = cache['k'].shape[1]
-            curr_cos = cos[start_pos : start_pos + Seq]
-            curr_sin = sin[start_pos : start_pos + Seq]
-
+        curr_cos = cos[start_pos:start_pos + Seq]
+        curr_sin = sin[start_pos:start_pos + Seq]
+        
         q = apply_rotary_emb(q, curr_cos, curr_sin)
         k = apply_rotary_emb(k, curr_cos, curr_sin)
 
-        # KV Cache
-        if cache is not None:
-            if cache['k'] is not None:
-                k = torch.cat([cache['k'], k], dim=1)
-                v = torch.cat([cache['v'], v], dim=1)
-            cache['k'], cache['v'] = k, v
+        # Update KV cache per batch item
+        if kv_caches is not None:
+            new_k_list = []
+            new_v_list = []
+            
+            for b in range(B):
+                # Ensure cache list is long enough
+                while len(kv_caches[b]) <= self.layer_idx:
+                    kv_caches[b].append({'k': None, 'v': None})
+                
+                cache = kv_caches[b][self.layer_idx]
+                k_b = k[b:b+1]  # [1, seq, n_kv_heads, head_dim]
+                v_b = v[b:b+1]
+                
+                if cache['k'] is not None:
+                    k_b = torch.cat([cache['k'], k_b], dim=1)
+                    v_b = torch.cat([cache['v'], v_b], dim=1)
+                
+                cache['k'] = k_b
+                cache['v'] = v_b
+                new_k_list.append(k_b)
+                new_v_list.append(v_b)
+            
+            max_cache_len = max(kk.shape[1] for kk in new_k_list)
+            
+            # Pad to same length for batched attention
+            k_padded = []
+            v_padded = []
+            for kk, vv in zip(new_k_list, new_v_list):
+                pad_len = max_cache_len - kk.shape[1]
+                if pad_len > 0:
+                    kk = F.pad(kk, (0, 0, 0, 0, pad_len, 0))  # left pad
+                    vv = F.pad(vv, (0, 0, 0, 0, pad_len, 0))
+                k_padded.append(kk)
+                v_padded.append(vv)
+            
+            k = torch.cat(k_padded, dim=0)  # [B, max_cache_len, n_kv_heads, head_dim]
+            v = torch.cat(v_padded, dim=0)
 
         # GQA expansion
         if self.n_kv_heads != self.n_heads:
@@ -137,10 +178,9 @@ class Attention(nn.Module):
 
         # Attention
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=(Seq > 1))
+        output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=(Seq > 1 and start_pos == 0))
         
         return self.o_proj(output.transpose(1, 2).contiguous().view(B, Seq, -1))
-
 
 class MLP(nn.Module):
     """SwiGLU MLP."""
@@ -162,6 +202,7 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.self_attn = Attention(config)
+        self.self_attn.layer_idx = layer_id  # Set layer index for KV cache
         self.mlp = MLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -172,16 +213,13 @@ class TransformerBlock(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         mask: Optional[torch.Tensor],
-        cache: Optional[Dict],
+        kv_caches: Optional[List[Dict]],  # List of caches per batch item
     ) -> torch.Tensor:
-        h = x + self.self_attn(self.input_layernorm(x), cos, sin, mask, cache)
+        h = x + self.self_attn(self.input_layernorm(x), cos, sin, mask, kv_caches)
         return h + self.mlp(self.post_attention_layernorm(h))
 
 class LlamaStage(nn.Module):
-    """
-    A pipeline stage containing a subset of transformer layers.
-    Rank 0 has embeddings, Rank N-1 has output head.
-    """
+    """Pipeline stage with batched KV cache support."""
     
     def __init__(self, hf_config, rank: int, device_map: Dict[int, List[int]]):
         super().__init__()
@@ -191,25 +229,20 @@ class LlamaStage(nn.Module):
         self.is_first = (rank == 0)
         self.is_last = (rank == max(device_map.keys()))
         
-        # Transformer layers for this stage
-        self.layers = nn.ModuleList([
-            TransformerBlock(hf_config, i) for i in self.my_layers
-        ])
+        # Create layers with correct local indices
+        self.layers = nn.ModuleList()
+        for i, global_idx in enumerate(self.my_layers):
+            block = TransformerBlock(hf_config, i)  # Use local index for KV cache
+            block.self_attn.layer_idx = i
+            self.layers.append(block)
         
-        # Embeddings (first stage only)
-        self.embed_tokens = None
         if self.is_first:
             self.embed_tokens = nn.Embedding(hf_config.vocab_size, hf_config.hidden_size)
         
-        # Output head (last stage only)
-        self.norm = None
-        self.lm_head = None
         if self.is_last:
             self.norm = RMSNorm(hf_config.hidden_size, eps=hf_config.rms_norm_eps)
             self.lm_head = nn.Linear(hf_config.hidden_size, hf_config.vocab_size, bias=False)
-            # Note: lm_head shape will be fixed during weight loading
         
-        # RoPE frequencies
         theta = getattr(hf_config, "rope_theta", 500000.0)
         max_seq = getattr(hf_config, "max_position_embeddings", 8192)
         head_dim = hf_config.hidden_size // hf_config.num_attention_heads
@@ -220,7 +253,7 @@ class LlamaStage(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        caches: List[Dict],
+        kv_caches: List[List[Dict]],  # [batch_size][layer_idx] -> {'k': ..., 'v': ...}
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Embedding
@@ -228,9 +261,7 @@ class LlamaStage(nn.Module):
         
         # Transformer layers
         for i, layer in enumerate(self.layers):
-            if len(caches) <= i:
-                caches.append({'k': None, 'v': None})
-            h = layer(h, self.cos, self.sin, mask, caches[i])
+            h = layer(h, self.cos, self.sin, mask, kv_caches)
         
         # Output projection
         if self.is_last and self.lm_head is not None:
