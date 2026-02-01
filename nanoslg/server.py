@@ -1,5 +1,5 @@
 """
-V0.2
+V0.3
 FastAPI server with batching support.
 """
 import asyncio
@@ -15,7 +15,7 @@ from transformers import AutoTokenizer
 
 from .config import ModelConfig, format_chat
 
-app = FastAPI(title="NanoSLG", version="0.2.0")
+app = FastAPI(title="NanoSLG", version="0.3.0")
 
 _tokenizer = None
 _request_queue = None  # mp.Queue - to send requests to worker
