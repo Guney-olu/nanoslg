@@ -1,5 +1,5 @@
 """
-V0.3
+V0.5
 FastAPI server with batching support.
 """
 import asyncio

@@ -6,129 +6,147 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![Status: Experimental](https://img.shields.io/badge/Status-Research%20Preview-orange)]()
 
-> A lightweight, educational LLM inference server with support for Pipeline Parallelism, Tensor Parallelism, and Hybrid (TP+PP) modes.
+> A lightweight, educational LLM inference server with support for Pipeline Parallelism, Tensor Parallelism, Hybrid (TP+PP) modes, and a dual-backend KV cache that auto-selects FlashInfer (L4/A100+) or contiguous SDPA (T4/fallback).
 
 ---
 
-## ✨ Features
+## ✨ What's New (v0.5)
+
+- **Dual KV Cache Backend** — auto-detects GPU and selects the fastest path:
+  - **FlashInfer paged attention** on SM80+ (L4, A100, H100) — fused kernels, zero-copy paged KV
+  - **Contiguous SDPA** on SM75 (T4) or as fallback — in-place writes, no gather overhead
+- **Radix prefix caching** — reuses KV cache across requests with shared prefixes (FlashInfer backend)
+- **No more gather_kv** — eliminated the per-layer full-copy bottleneck from v0.4
+- **Native GQA** — uses `enable_gqa=True` on PyTorch 2.5+, no more `repeat_interleave`
+- **`--backend` flag** — force `contiguous` or `flashinfer` for testing
+- **3-5× throughput improvement** over v0.4
+
+---
+
+## Features
 
 | Feature | Description |
 |---------|-------------|
-| 🔀 **Pipeline Parallelism** | Split model layers across GPUs sequentially |
-| ⚡ **Tensor Parallelism** | Shard weights across GPUs for parallel computation |
-| 🔄 **Hybrid Mode** | Combine TP + PP for maximum scalability |
-| 📦 **Continuous Batching** | Dynamic batch formation for higher throughput |
-| 🌊 **Streaming Responses** | Server-Sent Events (SSE) token streaming |
-| 📊 **Built-in Benchmarking** | TTFT, tokens/sec, memory tracking |
-| 🔧 **torch.compile** | Optimized with PyTorch 2.0 compilation |
-| 🧩 **Modular Design** | Easy to extend with new models |
+| **Pipeline Parallelism** | Split model layers across GPUs sequentially |
+| **Tensor Parallelism** | Shard weights across GPUs for parallel computation |
+| **Hybrid Mode** | Combine TP + PP for maximum scalability |
+| **Dual KV Cache** | FlashInfer paged (L4+) or contiguous SDPA (T4) — auto-selected |
+| **Radix Prefix Caching** | Reuse KV cache for shared prompt prefixes |
+| **Batch Scheduling** | Dynamic batch formation for higher throughput |
+| **Streaming Responses** | Server-Sent Events (SSE) token streaming |
+| **Built-in Benchmarking** | TTFT, tokens/sec, memory tracking |
+| **OpenAI-compatible API** | Drop-in replacement for `/v1/chat/completions` |
+| **Modular Design** | Easy to extend with new models |
 
 ---
 
-## 📊 Performance Results
+## Performance Results
 
-Tested on **2x NVIDIA L4 GPUs** with **Llama-3.1-8B-Instruct**:
+Tested on **2× NVIDIA L4 GPUs (24GB each)** with **Llama-3.1-8B-Instruct FP16**:
+
+### v0.5 (Current) vs v0.4
+
+| Metric | v0.4 (Paged+Gather) | v0.5 Contiguous | v0.5 FlashInfer | Improvement |
+|--------|---------------------|-----------------|-----------------|-------------|
+| **Single tok/s** | 13.8 | 21.8 | 21.5 | **+58%** |
+| **Single TTFT** | 106ms | 57ms | 52ms | **-51%** |
+| **Batch×4 tok/s** | 12.1 | 68.4 | **76.0** | **+528%** |
+| **KV Pressure tok/s** | 49.7 | 82.5 | 75.6 | **+66%** |
+| **Sustained tok/s** | 24.6 | 37.3 | 37.4 | **+52%** |
+| **Burst×16 tok/s** | 31.8 | 45.6 | 48.6 | **+53%** |
+| **Burst TTFT p50** | 7641ms | 5364ms | — | **-30%** |
+| **Benchmark duration** | 101s | 63s | — | **-37%** |
+
+### By Mode (v0.5)
 
 | Mode | Batch Size | Throughput | TTFT | Notes |
 |------|------------|------------|------|-------|
+| **Tensor Parallel** | 1 | ~22 tok/s | ~52ms | Lowest latency |
+| **Tensor Parallel** | 4 | **~76 tok/s** | ~64ms | Best throughput |
 | **Pipeline Parallel** | 1 | ~25 tok/s | ~85ms | Lower memory per GPU |
 | **Pipeline Parallel** | 4 | ~62 tok/s | ~95ms | Good scaling |
-| **Tensor Parallel** | 1 | ~29 tok/s | ~60ms | Lower latency |
-| **Tensor Parallel** | 4 | **~79 tok/s** | ~74ms | Best throughput |
-| **Hybrid (2x2)** | 4 | ~100+ tok/s | ~70ms | 4 GPU setup |
-
-### Throughput Comparison
-
-```
-Batch Size 4 Throughput (tok/s)
-═══════════════════════════════════════════════════════════════
-Pipeline (2 GPU) │████████████████████████████████░░░░░░░░│ 62
-Tensor (2 GPU) │█████████████████████████████████████████│ 79
-Hybrid (4 GPU) │████████████████████████████████████████████████│ 100+
-═══════════════════════════════════════════════════════════════
-```
+| **Hybrid (2×2)** | 4 | ~100+ tok/s | ~70ms | 4 GPU setup |
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
-### Parallelism Modes
+### Dual KV Cache Backend
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│ PARALLELISM MODES │
-├─────────────────────────────────────────────────────────────────────┤
-│ │
-│ PIPELINE PARALLEL (PP) TENSOR PARALLEL (TP) │
-│ ───────────────────── ───────────────────── │
-│ │
-│ ┌─────────┐ ┌─────────┬─────────┐ │
-│ │ GPU 0 │ Layers 0-15 │ GPU 0 │ GPU 1 │ │
-│ │ │ │ │ Head │ Head │ │
-│ └────┬────┘ │ │ 0-15 │ 16-31 │ │
-│ │ send ▼ └────┬────┴────┬────┘ │
-│ ┌────▼────┐ │AllReduce│ │
-│ │ GPU 1 │ Layers 16-31 └────┬────┘ │
-│ │ + Head │ │ │
-│ └─────────┘ ▼ │
-│ Output │
-│ │
-│ HYBRID (TP + PP) │
-│ ──────────────── │
-│ │
-│ PP Stage 0 PP Stage 1 │
-│ ┌─────────┬─────────┐ ┌─────────┬─────────┐ │
-│ │ GPU 0 │ GPU 1 │──▶│ GPU 2 │ GPU 3 │ │
-│ │ TP Rank │ TP Rank │ │ TP Rank │ TP Rank │ │
-│ │ 0 │ 1 │ │ 0 │ 1 │ │
-│ └─────────┴─────────┘ └─────────┴─────────┘ │
-│ Layers 0-15 (sharded) Layers 16-31 (sharded) │
-│ │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+flowchart TD
+    A[GPU Detection<br/>get_sm_version()] --> B{SM ≥ 80?}
+
+    B -->|Yes| C[FlashInfer Paged KV Cache<br/>(L4 / A100 / H100)]
+    B -->|No| D[Contiguous SDPA KV Cache<br/>(T4 / Fallback)]
+
+    C --> C1[Paged KV Pool]
+    C --> C2[Radix Prefix]
+    C --> C3[Fused Decode]
+    C --> C4[Zero-copy Read]
+    C --> C5[CoW Sharing]
+
+    D --> D1[Pre-allocated Cache<br/>[B,S,H,D]]
+    D --> D2[In-place Write]
+    D --> D3[Slice-based Read]
+    D --> D4[Native SDPA]
+
+    C --> E[CacheContext ABC]
+    D --> E[CacheContext ABC]
+
+    E --> E1[attend()]
+    E --> E2[get_position()]
+    E --> E3[get_start_pos()]
+
+    E --> F[Same Interface to Model]
 ```
 
 ### System Architecture
 
 ```
-                              ┌──────────────────┐
-                              │ HTTP Client │
-                              │ (curl/Python) │
-                              └────────┬─────────┘
-                                       │
-                                       ▼
-                              ┌──────────────────┐
-                              │ FastAPI Server │
-                              │ (async I/O) │
-                              └────────┬─────────┘
-                                       │
-                         ┌─────────────┴─────────────┐
-                         │ mp.Queue │
-                         │ (request/response) │
-                         └─────────────┬─────────────┘
-                                       │
-              ┌────────────────────────┼────────────────────────┐
-              │ │ │
-              ▼ ▼ ▼
-     ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
-     │ GPU 0 │ │ GPU 1 │ │ GPU N │
-     │ ┌───────────┐ │ │ ┌───────────┐ │ │ ┌───────────┐ │
-     │ │ TP Layers │ │────▶│ │ TP Layers │ │────▶│ │ TP Layers │ │
-     │ │ (sharded) │ │NCCL │ │ (sharded) │ │NCCL │ │ + LM Head │ │
-     │ └───────────┘ │ │ └───────────┘ │ │ └───────────┘ │
-     │ │ │ │ │ │
-     │ KV Cache │ │ KV Cache │ │ KV Cache │
-     └─────────────────┘ └─────────────────┘ └─────────────────┘
+                          ┌──────────────────┐
+                          │   HTTP Client     │
+                          │  (curl/Python)    │
+                          └────────┬─────────┘
+                                   │
+                                   ▼
+                          ┌──────────────────┐
+                          │  FastAPI Server   │
+                          │   (async I/O)     │
+                          └────────┬─────────┘
+                                   │
+                     ┌─────────────┴─────────────┐
+                     │       mp.Queue            │
+                     │  (request/response)       │
+                     └─────────────┬─────────────┘
+                                   │
+          ┌────────────────────────┼────────────────────────┐
+          │                        │                        │
+          ▼                        ▼                        ▼
+ ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+ │     GPU 0       │    │     GPU 1       │    │     GPU N       │
+ │ ┌───────────┐   │    │ ┌───────────┐   │    │ ┌───────────┐   │
+ │ │ TP Layers │   │───▶│ │ TP Layers │   │───▶│ │ TP Layers │   │
+ │ │ (sharded) │   │NCCL│ │ (sharded) │   │NCCL│ │ + LM Head │   │
+ │ └───────────┘   │    │ └───────────┘   │    │ └───────────┘   │
+ │ ┌───────────┐   │    │ ┌───────────┐   │    │ ┌───────────┐   │
+ │ │ KV Cache  │   │    │ │ KV Cache  │   │    │ │ KV Cache  │   │
+ │ │(auto-sel) │   │    │ │(auto-sel) │   │    │ │(auto-sel) │   │
+ │ └───────────┘   │    │ └───────────┘   │    │ └───────────┘   │
+ └─────────────────┘    └─────────────────┘    └─────────────────┘
 ```
 
 ---
 
-## 🚀 Installation
+## Installation
 
 ### Prerequisites
 - Python **3.10+**
 - PyTorch **2.0+** with CUDA
 - **2+ NVIDIA GPUs** (for parallelism)
 - NCCL for GPU communication
+- **GCC ≤ 12** (required for CUDA/FlashInfer JIT compilation)
 
 ### Setup
 
@@ -147,39 +165,27 @@ huggingface-cli download meta-llama/Llama-3.1-8B-Instruct \
 
 ---
 
-## 📖 Usage
+## Usage
 
 ### Basic Commands
 
 ```bash
-# Pipeline Parallel (default) - 2 GPUs
-python -m nanoslg --model /path/to/model --mode pipeline --pp-size 2
 # Tensor Parallel - 2 GPUs
 python -m nanoslg --model /path/to/model --mode tensor --tp-size 2
-# Hybrid Mode - 4 GPUs (2 TP x 2 PP)
-python -m nanoslg --model /path/to/model --mode hybrid --tp-size 2 --pp-size 2
-# With all options
+# Force a specific KV cache backend
+python -m nanoslg --model /path/to/model --mode tensor --backend contiguous
+python -m nanoslg --model /path/to/model --mode tensor --backend flashinfer --max-pages 2000
+
+# Full options
 python -m nanoslg \
     --model /path/to/Llama-3.1-8B-Instruct \
     --mode tensor \
     --tp-size 2 \
     --batch-size 4 \
-    --dtype bfloat16 \
+    --dtype float16 \
+    --backend auto \
     --port 8000
 ```
-
-### Command Line Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--model` | required | Path to HuggingFace model |
-| `--mode` | `pipeline` | Parallelism mode: `pipeline`, `tensor`, `hybrid` |
-| `--tp-size` | `1` | Tensor parallel degree |
-| `--pp-size` | `2` | Pipeline parallel degree |
-| `--batch-size` | `4` | Maximum batch size |
-| `--dtype` | `bfloat16` | Data type: `float16`, `bfloat16`, `float32` |
-| `--port` | `8000` | Server port |
-| `--host` | `0.0.0.0` | Server host |
 
 ### Client Examples
 
@@ -198,82 +204,30 @@ python inference.py --max-tokens 200 --benchmark "Is 500 days of summer a horror
 python inference.py --concurrent 4 --max-tokens 100 "Why do you say that name!!"
 ```
 
-## 🔧 Configuration
-
-### Registering Models
-
-```python
-# In nanoslg/config.py
-from nanoslg.config import ModelConfig, register_model
-# Pipeline Parallel setup
-register_model(ModelConfig(
-    name="llama-3.1-8b-pp",
-    path="/path/to/Llama-3.1-8B-Instruct",
-    parallel_mode="pipeline",
-    pp_size=2,
-    device_map={0: list(range(16)), 1: list(range(16, 32))},
-))
-# Tensor Parallel setup
-register_model(ModelConfig(
-    name="llama-3.1-8b-tp",
-    path="/path/to/Llama-3.1-8B-Instruct",
-    parallel_mode="tensor",
-    tp_size=2,
-))
-# Hybrid setup (4 GPUs)
-register_model(ModelConfig(
-    name="llama-3.1-8b-hybrid",
-    path="/path/to/Llama-3.1-8B-Instruct",
-    parallel_mode="hybrid",
-    tp_size=2,
-    pp_size=2,
-))
-```
-
----
-
-## 📁 Project Structure
-
-```
-nanoslg/
-├── __init__.py
-├── __main__.py # Entry point
-├── config.py # Configuration & model registry
-├── parallel.py # Parallelism infrastructure (TP/PP/Hybrid)
-├── tp_layers.py # Tensor parallel layer implementations
-├── models.py # Model architectures (LlamaTP, LlamaPP, LlamaHybrid)
-├── scheduler.py # Batch scheduler for continuous batching
-├── worker.py # Distributed inference workers
-├── server.py # FastAPI server
-└── benchmark.py # Benchmarking utilities
-```
-
----
-
-## 🗺️ Roadmap
+## Roadmap
 
 ### Completed ✅
 - [x] Pipeline Parallelism (PP)
 - [x] Tensor Parallelism (TP)
 - [x] Hybrid TP + PP mode
-- [x] Continuous batching
-- [x] `torch.compile` integration
+- [x] Batch scheduling
 - [x] Streaming responses (SSE)
 - [x] OpenAI-compatible API
 - [x] Built-in benchmarking
 - [x] Llama 3.x support
+- [x] Dual KV cache backend (FlashInfer + contiguous SDPA)
+- [x] Automatic GPU detection and backend selection
+- [x] Radix prefix caching (FlashInfer backend)
+- [x] Native GQA support (no expand overhead)
+- [x] Paged attention with copy-on-write
 
 ### In Progress
-- [ ] Pre-allocated KV cache (reduce recompilation)
-- [ ] CUDA Graphs for decode
+- [ ] Continuous batching (iteration-level scheduling)
 - [ ] Better warmup strategies
 
 ### Planned
 - [ ] Quantization (INT8 / INT4 / GPTQ / AWQ)
-- [ ] Flash Attention integration
 - [ ] Speculative decoding
-- [ ] PagedAttention
-- [ ] Prefix caching
 - [ ] Multi-node support
 - [ ] Qwen / Mistral / GLM model support
 - [ ] LoRA adapter support
@@ -282,60 +236,22 @@ nanoslg/
 
 ---
 
-## ⚡ Performance Tips
-
-### 1. Choose the Right Mode
-
-| Scenario | Recommended Mode |
-|----------|-----------------|
-| 2 GPUs, memory constrained | Pipeline Parallel |
-| 2 GPUs, latency sensitive | Tensor Parallel |
-| 4+ GPUs, maximum throughput | Hybrid |
-| Large batch inference | Tensor Parallel |
-
-### 2. Optimize Settings
-
-```bash
-# For best throughput
-python -m nanoslg \
-    --mode tensor \
-    --batch-size 8 \
-    --dtype bfloat16
-# For lowest latency
-python -m nanoslg \
-    --mode tensor \
-    --batch-size 1 \
-    --dtype float16
-```
----
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-**1. OOM Errors**
-
-```bash
-# Reduce batch size or use pipeline mode
-python -m nanoslg --mode pipeline --batch-size 2
-```
-
-**2. Slow First Request**
-
-- This is expected due to `torch.compile` warmup
-- Subsequent requests will be faster
-
----
-
-## 📚 References
+## References
 
 - [Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism](https://arxiv.org/abs/1909.08053)
 - [GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism](https://arxiv.org/abs/1811.06965)
+- [vLLM: Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180)
+- [FlashInfer: Efficient and Customizable Kernels for Large Language Model Inference Serving](https://arxiv.org/abs/2401.08765)
+- [FlashAttention: Fast and Memory-Efficient Exact Attention](https://arxiv.org/abs/2205.14135)
+- [FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning](https://arxiv.org/abs/2307.08691)
+- [SGLang: Efficient Execution of Structured Language Model Programs](https://arxiv.org/abs/2312.07104)
 - [PyTorch Distributed Documentation](https://pytorch.org/docs/stable/distributed.html)
+- [NCCL Documentation: Optimized Primitives for Multi-GPU Communication](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/index.html)
+- [CUDA Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html)
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 Contributions welcome! Areas of interest:
 - New model architectures (Qwen, Mistral, GLM etc.)

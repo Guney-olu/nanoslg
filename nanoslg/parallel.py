@@ -17,7 +17,7 @@ class ParallelMode(Enum):
     PIPELINE = "pipeline"      # PP only - split layers across GPUs
     TENSOR = "tensor"          # TP only - split tensors across GPUs
     HYBRID = "hybrid"          # TP + PP combined
-    DATA = "data"              # DP - replicate model (future)
+    DATA = "data"              # DP - replicate model
 
 
 @dataclass

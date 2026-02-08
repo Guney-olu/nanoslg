@@ -1,5 +1,5 @@
 """
-Configuration with parallel mode support.
+config for nanoslg server.
 """
 
 from dataclasses import dataclass, field
@@ -15,141 +15,119 @@ DEFAULT_PORT = 8000
 
 @dataclass
 class ModelConfig:
-    """Configuration for a model deployment."""
     name: str
     path: str
     dtype: str = "bfloat16"
     max_seq_len: int = 8192
-    
-    # Parallelism settings
-    parallel_mode: str = "pipeline"  # "pipeline", "tensor", "hybrid"
+
+    parallel_mode: str = "pipeline"
     tp_size: int = 1
     pp_size: int = 1
-    
-    # Layer distribution (for PP/hybrid)
     device_map: Dict[int, List[int]] = None
-    
+
+    # KV cache settings
+    page_size: int = 16
+    max_kv_pages: int = 0              # 0 = auto
+
+    kv_memory_fraction: float = 0.30
+    kv_backend: str = "auto"      
+
+    enable_prefix_caching: bool = True
+
     chat_template: str = "llama3"
-    
+
     def __post_init__(self):
-        # Auto-configure device_map if not provided
         if self.device_map is None and self.parallel_mode in ("pipeline", "hybrid"):
-            total_layers = self._infer_total_layers()
+            total = self._infer_total_layers()
             self.device_map = {}
-            for pp_rank in range(self.pp_size):
-                self.device_map[pp_rank] = get_layers_for_pp_rank(
-                    total_layers, self.pp_size, pp_rank
-                )
-    
+            for pp in range(self.pp_size):
+                self.device_map[pp] = get_layers_for_pp_rank(total, self.pp_size, pp)
+
     def _infer_total_layers(self) -> int:
-        """Infer total layers from model path (common configurations)."""
-        name_lower = self.name.lower()
-        if "3b" in name_lower or "3.2-3b" in name_lower:
-            return 28
-        elif "8b" in name_lower or "3.1-8b" in name_lower:
-            return 32
-        elif "70b" in name_lower:
-            return 80
-        return 32  # Default
-    
+        n = self.name.lower()
+        if "3b" in n:   return 28
+        if "8b" in n:   return 32
+        if "70b" in n:  return 80
+        if "14b" in n:  return 40   # Qwen2-14B
+        if "7b" in n:   return 32   # Qwen2-7B, Mistral-7B
+        return 32
+
     @property
     def world_size(self) -> int:
         return self.tp_size * self.pp_size
-    
+
     def get_parallel_config(self, total_layers: int = None) -> ParallelConfig:
-        """Create ParallelConfig from ModelConfig."""
         mode = ParallelMode(self.parallel_mode)
-        
-        config = ParallelConfig(
-            mode=mode,
-            world_size=self.world_size,
-            tp_size=self.tp_size,
-            pp_size=self.pp_size,
-        )
-        
-        # Set layer splits for PP modes
+        config = ParallelConfig(mode=mode, world_size=self.world_size,
+                                tp_size=self.tp_size, pp_size=self.pp_size)
         if mode in (ParallelMode.PIPELINE, ParallelMode.HYBRID):
             if self.device_map:
                 config.pp_layer_splits = self.device_map
             elif total_layers:
                 config.pp_layer_splits = {}
-                for pp_rank in range(self.pp_size):
-                    config.pp_layer_splits[pp_rank] = get_layers_for_pp_rank(
-                        total_layers, self.pp_size, pp_rank
-                    )
-        
+                for pp in range(self.pp_size):
+                    config.pp_layer_splits[pp] = get_layers_for_pp_rank(total_layers, self.pp_size, pp)
         return config
 
 
-# Model Registry
 _MODEL_REGISTRY: Dict[str, ModelConfig] = {}
 
-
-def register_model(config: ModelConfig):
-    _MODEL_REGISTRY[config.name] = config
-    print(f"[Registry] Registered: {config.name} ({config.parallel_mode} mode)")
-
+def register_model(c: ModelConfig):
+    _MODEL_REGISTRY[c.name] = c
+    print(f"[Registry] {c.name} ({c.parallel_mode})")
 
 def get_model_config(name: str) -> ModelConfig:
     if name not in _MODEL_REGISTRY:
-        raise ValueError(f"Model '{name}' not found. Available: {list(_MODEL_REGISTRY.keys())}")
+        raise ValueError(f"'{name}' not found. Available: {list(_MODEL_REGISTRY.keys())}")
     return _MODEL_REGISTRY[name]
-
 
 def list_models() -> List[str]:
     return list(_MODEL_REGISTRY.keys())
 
 
-
-# Pipeline Parallel (2 GPUs)
-# register_model(ModelConfig(
-#     name="llama-3.2-3b-pp",
-#     path="/path/to/Llama-3.2-3B-Instruct",
-#     parallel_mode="pipeline",
-#     pp_size=2,
-#     tp_size=1,
-#     device_map={0: list(range(14)), 1: list(range(14, 28))},
-# ))
-
-# Tensor Parallel (2 GPUs)
 register_model(ModelConfig(
     name="llama-3.1-8b-tp",
     path="./models/Llama-3.1-8B-Instruct",
-    parallel_mode="tensor",
-    tp_size=2,
-    pp_size=1,
+    parallel_mode="tensor", tp_size=2, pp_size=1,
+    page_size=16, enable_prefix_caching=True,
 ))
 
-# Hybrid (4 GPUs: 2 TP x 2 PP)
 # register_model(ModelConfig(
-#     name="llama-3.1-8b-hybrid",
-#     path="/path/to/Llama-3.1-8B-Instruct",
-#     parallel_mode="hybrid",
+#     name="llama-3.2-3b",
+#     path="./models/Llama-3.2-3B-Instruct",
+#     dtype="bfloat16",
+#     max_seq_len=8192,
+#     parallel_mode="tensor",   # or "tensor" if you prefer
 #     tp_size=2,
-#     pp_size=2,
-#     device_map={0: list(range(16)), 1: list(range(16, 32))},
+#     page_size=16,
+#     kv_memory_fraction=0.30,
+#     enable_prefix_caching=True,
+#     chat_template="llama3",
 # ))
 
 
-# Chat Templates
+# ── Chat Templates ──
+
 CHAT_TEMPLATES = {
     "llama3": {
         "message": "<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>",
         "assistant_start": "<|start_header_id|>assistant<|end_header_id|>\n\n",
-        "eos_token": "<|eot_id|>",
     },
-    "chatml": {
+    "chatml": {     
         "message": "<|im_start|>{role}\n{content}<|im_end|>\n",
         "assistant_start": "<|im_start|>assistant\n",
-        "eos_token": "<|im_end|}",
+    },
+    "chatglm": {
+        "message": "[gMASK]sop<|{role}|>\n{content}",
+        "assistant_start": "<|assistant|>\n",
     },
 }
 
 
 def format_chat(messages: List[dict], template_name: str = "llama3") -> str:
-    template = CHAT_TEMPLATES.get(template_name, CHAT_TEMPLATES["llama3"])
+    t = CHAT_TEMPLATES.get(template_name, CHAT_TEMPLATES["llama3"])
     prompt = ""
-    for msg in messages:
-        prompt += template["message"].format(role=msg["role"], content=msg["content"])
-    prompt += template["assistant_start"]
+    for m in messages:
+        prompt += t["message"].format(role=m["role"], content=m["content"])
+    prompt += t["assistant_start"]
     return prompt
